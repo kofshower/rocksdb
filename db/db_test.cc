@@ -2524,6 +2524,7 @@ class ModelDB : public DB {
     delete reinterpret_cast<const ModelSnapshot*>(snapshot);
   }
 
+
   virtual Status Write(const WriteOptions& /*options*/,
                        WriteBatch* batch) override {
     class Handler : public WriteBatch::Handler {
@@ -2546,6 +2547,10 @@ class ModelDB : public DB {
     return batch->Iterate(&handler);
   }
 
+  virtual Status WriteWithTTL(const WriteOptions& options, WriteBatch* updates, int /*expire_ts*/) override {
+      return Write(options, updates); 
+  }
+  
   using DB::GetProperty;
   virtual bool GetProperty(ColumnFamilyHandle* /*column_family*/,
                            const Slice& /*property*/,

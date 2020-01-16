@@ -166,6 +166,23 @@ class PosixMmapReadableFile : public RandomAccessFile {
   virtual Status InvalidateCache(size_t offset, size_t length) override;
 };
 
+// mmap() based random-access
+class PmemMmapReadableFile : public RandomAccessFile {
+ private:
+  int fd_;
+  std::string filename_;
+  void* mmapped_region_;
+  size_t length_;
+
+ public:
+  PmemMmapReadableFile(const int fd, const std::string& fname, void* base,
+                        size_t length, const EnvOptions& options);
+  virtual ~PmemMmapReadableFile();
+  virtual Status Read(uint64_t offset, size_t n, Slice* result,
+                      char* scratch) const override;
+  virtual Status InvalidateCache(size_t offset, size_t length) override;
+};
+
 class PosixMmapFile : public WritableFile {
  private:
   std::string filename_;
@@ -215,6 +232,55 @@ class PosixMmapFile : public WritableFile {
 #endif
 };
 
+class PmemMmapFile : public WritableFile {
+ private:
+  std::string filename_;
+  int fd_;
+  size_t page_size_;
+  size_t map_size_;       // How much extra memory to map at a time
+  char* base_;            // The mapped region
+  char* limit_;           // Limit of the mapped region
+  char* dst_;             // Where to write next  (in range [base_,limit_])
+  char* last_sync_;       // Where have we synced up to
+  uint64_t file_offset_;  // Offset of base_ in file
+#ifdef ROCKSDB_FALLOCATE_PRESENT
+  bool allow_fallocate_;  // If false, fallocate calls are bypassed
+  bool fallocate_with_keep_size_;
+#endif
+
+  // Roundup x to a multiple of y
+  static size_t Roundup(size_t x, size_t y) { return ((x + y - 1) / y) * y; }
+
+  size_t TruncateToPageBoundary(size_t s) {
+    s -= (s & (page_size_ - 1));
+    assert((s % page_size_) == 0);
+    return s;
+  }
+
+  Status MapNewRegion();
+  Status UnmapCurrentRegion();
+  Status Msync();
+
+ public:
+  PmemMmapFile(const std::string& fname, int fd, size_t page_size,
+                const EnvOptions& options);
+  ~PmemMmapFile();
+
+  // Means Close() will properly take care of truncate
+  // and it does not need any additional information
+  virtual Status Truncate(uint64_t /*size*/) override { return Status::OK(); }
+  virtual Status Close() override;
+  virtual Status Append(const Slice& data) override;
+  virtual Status Flush() override;
+  virtual Status Sync() override;
+  virtual Status Fsync() override;
+  virtual uint64_t GetFileSize() override;
+  virtual Status InvalidateCache(size_t offset, size_t length) override;
+#ifdef ROCKSDB_FALLOCATE_PRESENT
+  virtual Status Allocate(uint64_t offset, uint64_t len) override;
+#endif
+};
+
 class PosixRandomRWFile : public RandomRWFile {
  public:
   explicit PosixRandomRWFile(const std::string& fname, int fd,
@@ -241,6 +307,13 @@ struct PosixMemoryMappedFileBuffer : public MemoryMappedFileBuffer {
       : MemoryMappedFileBuffer(_base, _length) {}
   virtual ~PosixMemoryMappedFileBuffer();
 };
+
+struct PmemMmappedFileBuffer : public MemoryMappedFileBuffer {
+  PmemMmappedFileBuffer(void* _base, size_t _length)
+      : MemoryMappedFileBuffer(_base, _length) {}
+  virtual ~PmemMmappedFileBuffer();
+};
+
 
 class PosixDirectory : public Directory {
  public:

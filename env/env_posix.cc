@@ -227,8 +227,10 @@ class PosixEnv : public Env {
       if (s.ok()) {
         void* base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
         if (base != MAP_FAILED) {
-          result->reset(new PosixMmapReadableFile(fd, fname, base,
+          result->reset(new PmemMmapReadableFile(fd, fname, base,
                                                   size, options));
+          //result->reset(new PosixMmapReadableFile(fd, fname, base,
+          //                                        size, options));
         } else {
           s = IOError("while mmap file for read", fname, errno);
           close(fd);
@@ -304,7 +306,8 @@ class PosixEnv : public Env {
       }
     }
     if (options.use_mmap_writes && !forceMmapOff_) {
-      result->reset(new PosixMmapFile(fname, fd, page_size_, options));
+      //result->reset(new PosixMmapFile(fname, fd, page_size_, options));
+      result->reset(new PmemMmapFile(fname, fd, page_size_, options));
     } else if (options.use_direct_writes && !options.use_mmap_writes) {
 #ifdef OS_MACOSX
       if (fcntl(fd, F_NOCACHE, 1) == -1) {
@@ -401,7 +404,8 @@ class PosixEnv : public Env {
       }
     }
     if (options.use_mmap_writes && !forceMmapOff_) {
-      result->reset(new PosixMmapFile(fname, fd, page_size_, options));
+      //result->reset(new PosixMmapFile(fname, fd, page_size_, options));
+      result->reset(new PmemMmapFile(fname, fd, page_size_, options));
     } else if (options.use_direct_writes && !options.use_mmap_writes) {
 #ifdef OS_MACOSX
       if (fcntl(fd, F_NOCACHE, 1) == -1) {
@@ -487,7 +491,8 @@ class PosixEnv : public Env {
     }
     if (status.ok()) {
       result->reset(
-          new PosixMemoryMappedFileBuffer(base, static_cast<size_t>(size)));
+          //new PosixMemoryMappedFileBuffer(base, static_cast<size_t>(size)));
+          new PmemMmappedFileBuffer(base, static_cast<size_t>(size)));
     }
     if (fd >= 0) {
       // don't need to keep it open after mmap has been called

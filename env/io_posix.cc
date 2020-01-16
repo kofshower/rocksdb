@@ -34,7 +34,10 @@
 #include "util/coding.h"
 #include "util/string_util.h"
 #include "util/sync_point.h"
-
+#include "libpmem.h"
+#define   PRINT_MACRO_HELPER(x)   #x 
+#define   PRINT_MACRO(x)   #x "=" PRINT_MACRO_HELPER(x) 
+#pragma message(PRINT_MACRO(ROCKSDB_FALLOCATE_PRESENT))
 #if defined(OS_LINUX) && !defined(F_SET_RW_HINT)
 #define F_LINUX_SPECIFIC_BASE 1024
 #define F_SET_RW_HINT         (F_LINUX_SPECIFIC_BASE + 12)
@@ -491,6 +494,56 @@ Status PosixMmapReadableFile::InvalidateCache(size_t offset, size_t length) {
 }
 
 /*
+ * PmemMmapReadableFile
+ *
+ * mmap() based random-access
+ */
+// base[0,length-1] contains the mmapped contents of the file.
+PmemMmapReadableFile::PmemMmapReadableFile(const int fd,
+                                             const std::string& fname,
+                                             void* base, size_t length,
+                                             const EnvOptions& options)
+    : fd_(fd), filename_(fname), mmapped_region_(base), length_(length) {
+#ifdef NDEBUG
+  (void)options;
+#endif
+  fd_ = fd_ + 0;  // suppress the warning for used variables
+  assert(options.use_mmap_reads);
+  assert(!options.use_direct_reads);
+}
+
+PmemMmapReadableFile::~PmemMmapReadableFile() {
+  int ret = munmap(mmapped_region_, length_);
+  if (ret != 0) {
+    fprintf(stdout, "failed to munmap %p length %" ROCKSDB_PRIszt " \n",
+            mmapped_region_, length_);
+  }
+  close(fd_);
+}
+
+Status PmemMmapReadableFile::Read(uint64_t offset, size_t n, Slice* result,
+                                   char* /*scratch*/) const {
+  Status s;
+  if (offset > length_) {
+    *result = Slice();
+    return IOError("While mmap read offset " + ToString(offset) +
+                       " larger than file length " + ToString(length_),
+                   filename_, EINVAL);
+  } else if (offset + n > length_) {
+    n = static_cast<size_t>(length_ - offset);
+  }
+  *result = Slice(reinterpret_cast<char*>(mmapped_region_) + offset, n);
+  return s;
+}
+
+Status PmemMmapReadableFile::InvalidateCache(size_t offset, size_t length) {
+  (void)offset;
+  (void)length;
+  return Status::OK();
+}
+
+
+/*
  * PosixMmapFile
  *
  * We preallocate up to an extra megabyte and use memcpy to append new
@@ -720,6 +773,230 @@ Status PosixMmapFile::Allocate(uint64_t offset, uint64_t len) {
   }
 }
 #endif
+
+/*
+ * PmemMmapFile
+ *
+ * We preallocate up to an extra megabyte and use memcpy to append new
+ * data to the file.  This is safe since we either properly close the
+ * file before reading from it, or for log files, the reading code
+ * knows enough to skip zero suffixes.
+ */
+Status PmemMmapFile::UnmapCurrentRegion() {
+  TEST_KILL_RANDOM("PmemMmapFile::UnmapCurrentRegion:0", rocksdb_kill_odds);
+  if (base_ != nullptr) {
+    int munmap_status = munmap(base_, limit_ - base_);
+    if (munmap_status != 0) {
+      return IOError("While munmap", filename_, munmap_status);
+    }
+    file_offset_ += limit_ - base_;
+    base_ = nullptr;
+    limit_ = nullptr;
+    last_sync_ = nullptr;
+    dst_ = nullptr;
+
+    // Increase the amount we map the next time, but capped at 1MB
+    if (map_size_ < (1 << 20)) {
+      map_size_ *= 2;
+    }
+  }
+  return Status::OK();
+}
+
+Status PmemMmapFile::MapNewRegion() {
+#ifdef ROCKSDB_FALLOCATE_PRESENT
+  assert(base_ == nullptr);
+  TEST_KILL_RANDOM("PmemMmapFile::UnmapCurrentRegion:0", rocksdb_kill_odds);
+  // we can't fallocate with FALLOC_FL_KEEP_SIZE here
+  if (allow_fallocate_) {
+    IOSTATS_TIMER_GUARD(allocate_nanos);
+    int alloc_status = fallocate(fd_, 0, file_offset_, map_size_);
+    if (alloc_status != 0) {
+      // fallback to posix_fallocate
+      alloc_status = posix_fallocate(fd_, file_offset_, map_size_);
+    }
+    if (alloc_status != 0) {
+      return Status::IOError("Error allocating space to file : " + filename_ +
+                             "Error : " + strerror(alloc_status));
+    }
+  }
+
+  TEST_KILL_RANDOM("PmemMmapFile::Append:1", rocksdb_kill_odds);
+  void* ptr = mmap(nullptr, map_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_,
+                   file_offset_);
+  if (ptr == MAP_FAILED) {
+    return Status::IOError("MMap failed on " + filename_);
+  }
+  TEST_KILL_RANDOM("PmemMmapFile::Append:2", rocksdb_kill_odds);
+
+  base_ = reinterpret_cast<char*>(ptr);
+  limit_ = base_ + map_size_;
+  dst_ = base_;
+  last_sync_ = base_;
+  return Status::OK();
+#else
+  return Status::NotSupported("This platform doesn't support fallocate()");
+#endif
+}
+
+Status PmemMmapFile::Msync() {
+  if (dst_ == last_sync_) {
+    return Status::OK();
+  }
+  return Status::OK();
+}
+
+PmemMmapFile::PmemMmapFile(const std::string& fname, int fd, size_t page_size,
+                             const EnvOptions& options)
+    : filename_(fname),
+      fd_(fd),
+      page_size_(page_size),
+      map_size_(Roundup(65536, page_size)),
+      base_(nullptr),
+      limit_(nullptr),
+      dst_(nullptr),
+      last_sync_(nullptr),
+      file_offset_(0) {
+#ifdef ROCKSDB_FALLOCATE_PRESENT
+  allow_fallocate_ = options.allow_fallocate;
+  fallocate_with_keep_size_ = options.fallocate_with_keep_size;
+#else
+  (void)options;
+#endif
+  assert((page_size & (page_size - 1)) == 0);
+  assert(options.use_mmap_writes);
+  assert(!options.use_direct_writes);
+}
+
+PmemMmapFile::~PmemMmapFile() {
+  if (fd_ >= 0) {
+    PmemMmapFile::Close();
+  }
+}
+
+Status PmemMmapFile::Append(const Slice& data) {
+  const char* src = data.data();
+  size_t left = data.size();
+  while (left > 0) {
+    assert(base_ <= dst_);
+    assert(dst_ <= limit_);
+    size_t avail = limit_ - dst_;
+    if (avail == 0) {
+      Status s = UnmapCurrentRegion();
+      if (!s.ok()) {
+        return s;
+      }
+      s = MapNewRegion();
+      if (!s.ok()) {
+        return s;
+      }
+      TEST_KILL_RANDOM("PmemMmapFile::Append:0", rocksdb_kill_odds);
+    }
+
+    size_t n = (left <= avail) ? left : avail;
+    assert(dst_);
+    pmem_memcpy_persist(dst_,src,n);
+    //printf("chaijunjun call pmem_memcpy\n");
+    dst_ += n;
+    src += n;
+    left -= n;
+  }
+  return Status::OK();
+}
+
+Status PmemMmapFile::Close() {
+  Status s;
+  size_t unused = limit_ - dst_;
+
+  s = UnmapCurrentRegion();
+  if (!s.ok()) {
+    s = IOError("While closing mmapped file", filename_, errno);
+  } else if (unused > 0) {
+    // Trim the extra space at the end of the file
+    if (ftruncate(fd_, file_offset_ - unused) < 0) {
+      s = IOError("While ftruncating mmaped file", filename_, errno);
+    }
+  }
+
+  if (close(fd_) < 0) {
+    if (s.ok()) {
+      s = IOError("While closing mmapped file", filename_, errno);
+    }
+  }
+
+  fd_ = -1;
+  base_ = nullptr;
+  limit_ = nullptr;
+  return s;
+}
+
+Status PmemMmapFile::Flush() { return Status::OK(); }
+
+Status PmemMmapFile::Sync() {
+  if (fdatasync(fd_) < 0) {
+    return IOError("While fdatasync mmapped file", filename_, errno);
+  }
+
+  return Msync();
+}
+
+/**
+ * Flush data as well as metadata to stable storage.
+ */
+Status PmemMmapFile::Fsync() {
+  if (fsync(fd_) < 0) {
+    return IOError("While fsync mmaped file", filename_, errno);
+  }
+
+  return Msync();
+}
+
+/**
+ * Get the size of valid data in the file. This will not match the
+ * size that is returned from the filesystem because we use mmap
+ * to extend file by map_size every time.
+ */
+uint64_t PmemMmapFile::GetFileSize() {
+  size_t used = dst_ - base_;
+  return file_offset_ + used;
+}
+
+Status PmemMmapFile::InvalidateCache(size_t offset, size_t length) {
+#ifndef OS_LINUX
+  (void)offset;
+  (void)length;
+  return Status::OK();
+#else
+  // free OS pages
+  int ret = Fadvise(fd_, offset, length, POSIX_FADV_DONTNEED);
+  if (ret == 0) {
+    return Status::OK();
+  }
+  return IOError("While fadvise NotNeeded mmapped file", filename_, errno);
+#endif
+}
+
+#ifdef ROCKSDB_FALLOCATE_PRESENT
+Status PmemMmapFile::Allocate(uint64_t offset, uint64_t len) {
+  assert(offset <= std::numeric_limits<off_t>::max());
+  assert(len <= std::numeric_limits<off_t>::max());
+  TEST_KILL_RANDOM("PmemMmapFile::Allocate:0", rocksdb_kill_odds);
+  int alloc_status = 0;
+  if (allow_fallocate_) {
+    alloc_status = fallocate(
+        fd_, fallocate_with_keep_size_ ? FALLOC_FL_KEEP_SIZE : 0,
+          static_cast<off_t>(offset), static_cast<off_t>(len));
+  }
+  if (alloc_status == 0) {
+    return Status::OK();
+  } else {
+    return IOError(
+        "While fallocate offset " + ToString(offset) + " len " + ToString(len),
+        filename_, errno);
+  }
+}
+#endif
+
 
 /*
  * PosixWritableFile
@@ -1056,6 +1333,12 @@ PosixMemoryMappedFileBuffer::~PosixMemoryMappedFileBuffer() {
   // TODO should have error handling though not much we can do...
   munmap(this->base_, length_);
 }
+
+PmemMmappedFileBuffer::~PmemMmappedFileBuffer() {
+  // TODO should have error handling though not much we can do...
+  munmap(this->base_, length_);
+}
+
 
 /*
  * PosixDirectory
